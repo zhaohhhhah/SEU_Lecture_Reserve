@@ -1,0 +1,21 @@
+# 本地真实配置（含账号密码 / 邮箱授权码），绝不提交
+config.yaml
+.env
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 运行产物 / 调试截图 / 备份
+*.log
+*.bak
+*.bak-*
+shot_*.png
+.seu_*
+
+# 系统
+.DS_Store
+Thumbs.db

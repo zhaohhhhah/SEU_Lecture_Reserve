@@ -17,39 +17,15 @@
    ```shell
    pip install -r requirements.txt
    ```
-6. 配置账户信息和偏好
-7. 在 main.py 文件中修改全局配置相关信息：
-```python
-# ==================== 全局配置项 ====================
-CONFIG = {
-    # 登录凭证
-    "card_number": "",  # 一卡通号
-    "password": "",  # 登录密码
-
-    # 讲座筛选条件
-    "preferred_lectures": [],
-    "required_categories": [
-        "人文与科学素养系列讲座_心理健康",
-        "人文与科学素养系列讲座_法律",
-        "人文与科学素养系列讲座-艺术类",
-        "人文与科学素养系列讲座_其他",
-        '“SEU咖啡间"系列沙龙活动'
-    ],
-    "preferred_campus": [],# 优先选择的校区
-    "enable_offline": True, # 是否抢线下讲座
-    "enable_online": True, # 是否抢线上讲座
-
-    # ==================== 时间参数配置 ====================
-    "timeout_settings": {
-        "page_load": 0.5,  # 页面加载基础等待时间
-        "element_wait": 3,  # 元素查找最大等待时间
-        "login_redirect": 2,  # 登录跳转等待时间 # 浏览器未认证或掉认证时将此设定为较长时间(例如60s)，完成短信验证码认证后即可修改为正常值
-        "scan_interval": 0.05,  # 扫描间隔时间
-        "retry_delay": 0.05,  # 重试延迟时间
-        "action_confirm": 0.2,  # 操作确认等待时间
-    }
-}
-```
+6. 配置账户信息和偏好：复制配置模板并填写
+   ```shell
+   cp config.yaml.example config.yaml
+   ```
+   在 `config.yaml` 里填上 `card_number`（一卡通号）、`password`，以及接收通知的
+   `qq_email` / `qq_auth_code`（QQ 邮箱 SMTP 授权码）。`config.yaml` 已加入 `.gitignore`，
+   不会被提交；只写想改的项也可以，其余用 `main.py` 里的默认值。
+7. 敏感配置也可以用环境变量覆盖（优先于 `config.yaml`）：
+   `SEU_CARD_NUMBER`、`SEU_PASSWORD`、`QQ_EMAIL_ADDRESS`、`QQ_EMAIL_AUTH_CODE`
 ## 注意事项
 1. 首次运行请自行下载配置浏览器驱动，注意版本对应（约需1分钟）
 2. 浏览器未认证或掉认证时将登录跳转等待时间设定为较长时间(例如60s)，完成短信验证码认证后即可修改为正常值
