@@ -31,12 +31,20 @@ required_categories:
   - '“SEU咖啡间"系列沙龙活动'
 
 # 优先校区，排在前面的优先抢
-preferred_campus:
-  - "九龙湖校区"
-  - "四牌楼校区"
+preferred_campus: []   # 校区白名单，留空 = 不限校区（优先级由下面 priority 决定）
 
 enable_offline: true   # 是否抢线下讲座
-enable_online: false   # 是否抢线上讲座
+enable_online: true    # 是否抢线上讲座（标题里含“线上”的）
+
+# ==================== 抢票优先级 ====================
+# 越靠前越先抢；不在这张表里的一律排最后，但仍然会抢。
+#   campus: 校区名（也匹配地点字段里含这几个字的讲座）
+#   mode:   online = 标题含“线上”；offline = 线下
+priority:
+  - campus: "四牌楼校区"
+    mode: "online"
+  - campus: "九龙湖校区"
+    mode: "offline"
 
 # ==================== 回流票监控 ====================
 # 抢票窗口结束后，继续进出详情页检测是否有别人退掉的名额

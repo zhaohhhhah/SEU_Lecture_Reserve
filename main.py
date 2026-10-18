@@ -516,6 +516,7 @@ def parse_lecture(element):
             "category": category,
             "title": title,
             "campus": _extract_campus(location),
+            "location": location,
             "start_time": start_time,
             "end_time": end_time,
             "open_time": open_time,
@@ -540,18 +541,44 @@ def _extract_campus(location):
     campus_match = re.match(r'^(.+?校区)', location)
     return campus_match.group(1) if campus_match else location
 
+def _lecture_tier(lecture):
+    """按 CONFIG["priority"] 的顺序返回档位（0 = 最想抢）。不在表里的排最后。
+    每条规则可写 campus（校区，允许写成“四牌楼校区”，也匹配地点里含这几个字）
+    和 mode（online/offline）。两个键都省略 = 通配。"""
+    is_online = "线上" in lecture["title"]
+    mode = "online" if is_online else "offline"
+    rules = CONFIG.get("priority") or []
+    location = lecture.get("location", "")
+    # 线上场次的校区是“腾讯会议”，真正归属看同名线下场次（scan_cards 补的 host_campus）
+    campus = lecture.get("host_campus") or lecture["campus"]
+    for i, r in enumerate(rules):
+        if not isinstance(r, dict):
+            continue
+        _mode = r.get("mode")
+        if _mode and _mode != mode:
+            continue
+        _campus = r.get("campus")
+        if _campus and (_campus not in campus and _campus not in location):
+            continue
+        return i
+    return len(rules)
+
+
+def _norm_title(t):
+    """去掉标题开头的【线上】/【线下】，用来把同一场讲座的线上/线下两条记录对上"""
+    return re.sub(r"^【(线上|线下)】\s*", "", (t or "").strip())
+
 def _sort_priority(lecture):
     """
     讲座排序优先级规则（升序排列）
-    1. 必需类别优先
-    2. 优先校区/线上优先
-    3. 时间最近优先
+    1. CONFIG["priority"] 的档位：四牌楼+线上 > 九龙湖+线下 > 其余
+    2. 必需类别优先（preferred_lectures 命中时类别不参与）
+    3. 预约开放时间早的优先——今晚谁先开抢谁优先；
+       原来按讲座 start_time 排，会把下下周才开放预约的排成第一目标，今晚只能空转。
     """
     required_priority = 0 if lecture["category"] in CONFIG["required_categories"] else 1
-    is_online = "线上" in lecture["title"]
-    # 校区白名单是 list，必须用 in（原来写成 == 恒为 False，等于没排序）
-    campus_priority = 0 if (is_online or lecture["campus"] in CONFIG["preferred_campus"]) else 1
-    return (required_priority, campus_priority, lecture["start_time"])
+    open_t = _parse_hd_time(lecture.get("open_time")) or lecture["start_time"]
+    return (_lecture_tier(lecture), required_priority, open_t, lecture["start_time"])
 
 def _fmt_time(t, default="?"):
     """parse_lecture 里 start_time/end_time 是 datetime，邮件里格式化成人看的样子"""
@@ -559,6 +586,29 @@ def _fmt_time(t, default="?"):
         return t.strftime("%Y/%m/%d %H:%M")
     except Exception:
         return str(t) if t else default
+
+def _parse_hd_time(s):
+    """把预约窗口 "YYYY/MM/DD HH:MM" 解析成 datetime；解析不了返回 None"""
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s.strip(), "%Y/%m/%d %H:%M")
+    except Exception:
+        return None
+
+def _grabs_tonight(lecture, now=None):
+    """今晚 19:00 这场是否抢得到：
+    - 预约窗口已经截止 → 抢不了
+    - 明天或以后才开放预约 → 今晚点了也是「未开放」，空转一整晚
+    解析不到就当作能抢（宁松勿漏：格式一变宁可多试，也别把该抢的漏掉）。"""
+    now = now or datetime.now()
+    close_t = _parse_hd_time(lecture.get("close_time"))
+    open_t = _parse_hd_time(lecture.get("open_time"))
+    if close_t is not None and close_t <= now:
+        return False
+    if open_t is not None and open_t.date() > now.date():
+        return False
+    return True
 
 # ==================== 看门狗状态标记 ====================
 # .seu_active  存在 = 这一轮还没正常收尾（崩了就该被 guard 拉起）
@@ -616,7 +666,9 @@ def is_candidate(lecture):
         return False
     if (not is_online) and not CONFIG["enable_offline"]:
         return False
-    if (not is_online) and lecture["campus"] not in CONFIG["preferred_campus"]:
+    # 校区白名单为空 = 不限校区（优先级靠 CONFIG["priority"] 排，见 _lecture_tier）
+    _campus_allow = CONFIG.get("preferred_campus") or []
+    if (not is_online) and _campus_allow and lecture["campus"] not in _campus_allow:
         return False
     return True
 
@@ -637,6 +689,17 @@ def scan_cards():
         lec = parse_lecture(el)
         if lec:
             out.append(lec)
+
+    # 线上场次没有校区（地点写的是“腾讯会议”），用**同名线下场次**的校区补上，
+    # 这样“四牌楼线上/九龙湖线上”才排得了序。
+    # 例：【线上】【艺术】希望、焦虑… ↔ 【线下】【艺术】希望、焦虑…（四牌楼校区）
+    _host_campus = {}
+    for c in out:
+        if "线上" not in c["title"]:
+            _host_campus[_norm_title(c["title"])] = c["campus"]
+    for c in out:
+        if "线上" in c["title"]:
+            c["host_campus"] = _host_campus.get(_norm_title(c["title"]), "")
     return out
 
 LIST_URL = "https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do#/hdyy"
@@ -1012,12 +1075,32 @@ def precheck_and_notify():
     没有符合条件的讲座则发“今天不抢”邮件并返回 (None, None)。"""
     print("🔎 18:50 预检查今天的讲座...")
     cards = scan_cards()
-    # 按优先级排序：必需类别 > 优先校区/线上 > 时间最近。排在最前 = 今晚的第一目标
-    cands = sorted([c for c in cards if is_candidate(c)], key=_sort_priority)
+    # 先按条件筛，再按“今晚抢不抢得到”核日期：预约未截止、且不是明天以后才开放。
+    # 不核日期的后果：列表里有 4 场时，会把下下周才开预约的排成第一目标，
+    # 19:00 点进去按钮一直是「未开放」，空转一整晚，真正开放的那场反而没抢。
+    _now = datetime.now()
+    _matched = [c for c in cards if is_candidate(c)]
+    for c in _matched:
+        if not _grabs_tonight(c, _now):
+            print(f"⏭ 跳过（不在今晚开放窗口）: {c['title'][:36]}｜预约 {c.get('open_time') or '?'} ~ {c.get('close_time') or '?'}")
+    cands = sorted([c for c in _matched if _grabs_tonight(c, _now)], key=_sort_priority)
+    for _i, c in enumerate(cands):
+        _mode = "线上" if "线上" in c["title"] else "线下"
+        _cp = c.get("host_campus") or c["campus"]
+        _mark = "🎯 第一目标" if _i == 0 else "   备选"
+        print(f"  {_mark}｜第{_lecture_tier(c) + 1}档 {_mode}/{_cp}｜{c['title'][:40]}")
     if not cands:
-        print("今天没有符合条件的讲座，跳过今天")
-        send_qq_mail("【SEU抢票】今天不抢讲座",
-                     "18:50 预检查：今天没有符合条件的讲座，跳过今天，不抢。")
+        if _matched:
+            detail = "\n".join(f"· {c['title']}　预约 {c.get('open_time') or '?'} ~ {c.get('close_time') or '?'}"
+                               for c in _matched)
+            print(f"有 {len(_matched)} 场符合条件，但都不在今晚的开放窗口，跳过今天")
+            send_qq_mail("【SEU抢票】今天不抢讲座",
+                         f"18:50 预检查：有 {len(_matched)} 场符合筛选条件，但预约都已截止、"
+                         f"或要等到明天以后才开放，今晚抢不了，跳过。\n\n{detail}")
+        else:
+            print("今天没有符合条件的讲座，跳过今天")
+            send_qq_mail("【SEU抢票】今天不抢讲座",
+                         "18:50 预检查：今天没有符合条件的讲座，跳过今天，不抢。")
         return None, None
     targets = {c["title"]: c for c in cands}  # 已按优先级插入，第一个即第一目标
     first = cands[0]
@@ -1026,15 +1109,18 @@ def precheck_and_notify():
         "",
         f"【第一目标】{first['title']}",
         f"  类别：{first.get('category', '?')}",
-        f"  校区：{first.get('campus', '?')}",
+        f"  形式：{'线上' if '线上' in first['title'] else '线下'}（第 {_lecture_tier(first) + 1} 档）",
+        f"  校区：{first.get('host_campus') or first.get('campus', '?')}",
         f"  讲座时间：{_fmt_time(first.get('start_time'))} ~ {_fmt_time(first.get('end_time'))}",
         f"  预约窗口：{first.get('open_time', '?')} ~ {first.get('close_time', '?')}",
     ]
     if len(cands) > 1:
         lines.append("")
-        lines.append(f"【备选 {len(cands) - 1} 场】按优先级（第一目标没抢到就依次试）：")
+        lines.append(f"【备选 {len(cands) - 1} 场】按优先级：")
         for i, c in enumerate(cands[1:], 1):
-            lines.append(f"  {i}) {c['title']}｜{c.get('campus', '?')}｜开放 {c.get('open_time', '?')}")
+            _mode = "线上" if "线上" in c["title"] else "线下"
+            lines.append(f"  {i}) 第{_lecture_tier(c) + 1}档 {_mode}/{c.get('host_campus') or c.get('campus', '?')}"
+                         f"｜{c['title']}｜开放 {c.get('open_time', '?')}")
     lines += ["", "19:00 进入详情页点“预约”。抢到 / 没抢到 / 转回流监控都会再通知你。"]
     send_qq_mail(f"【SEU抢票】今晚目标：{first['title'][:24]}", "\n".join(lines))
     print(f"✅ 发现 {len(cands)} 场，第一目标: {first['title']}")
