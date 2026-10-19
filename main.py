@@ -1087,11 +1087,19 @@ def backflow_watch(targets, until_ts):
     return False
 
 # ==================== 主流程控制 ====================
+def _send_logged(subject, body):
+    """发信前把主题和正文打进日志，方便复盘“今晚到底发了什么”"""
+    print(f"📧 发送邮件：《{subject}》\n{body}")
+    return send_qq_mail(subject, body)
+
+
 def precheck_and_notify():
     """18:50 预检查：扫描今天的讲座、按优先级排序、发通知邮件。
     返回 (targets, first)：有讲座时 targets={标题:讲座}(已按优先级插入，第一个即第一目标)、first=第一目标；
     没有符合条件的讲座则发“今天不抢”邮件并返回 (None, None)。"""
-    print("🔎 18:50 预检查今天的讲座...")
+    # 时间一律取实际时刻：手动提前跑时邮件里不该再写死“18:50”
+    _hhmm = datetime.now().strftime("%H:%M")
+    print(f"🔎 {_hhmm} 预检查今天的讲座...")
     cards = scan_cards()
     # 先按条件筛，再按“今晚抢不抢得到”核日期：预约未截止、且不是明天以后才开放。
     # 不核日期的后果：列表里有 4 场时，会把下下周才开预约的排成第一目标，
@@ -1116,18 +1124,18 @@ def precheck_and_notify():
             detail = "\n".join(f"· {c['title']}　预约 {c.get('open_time') or '?'} ~ {c.get('close_time') or '?'}"
                                for c in _matched)
             print(f"有 {len(_matched)} 场符合条件，但都不在今晚的开放窗口，跳过今天")
-            send_qq_mail("【SEU抢票】今天不抢讲座",
-                         f"18:50 预检查：有 {len(_matched)} 场符合筛选条件，但预约都已截止、"
+            _send_logged("【SEU抢票】今天不抢讲座",
+                         f"{_hhmm} 预检查：有 {len(_matched)} 场符合筛选条件，但预约都已截止、"
                          f"或要等到明天以后才开放，今晚抢不了，跳过。\n\n{detail}")
         else:
             print("今天没有符合条件的讲座，跳过今天")
-            send_qq_mail("【SEU抢票】今天不抢讲座",
-                         "18:50 预检查：今天没有符合条件的讲座，跳过今天，不抢。")
+            _send_logged("【SEU抢票】今天不抢讲座",
+                         f"{_hhmm} 预检查：今天没有符合条件的讲座，跳过今天，不抢。")
         return None, None
     targets = {c["title"]: c for c in cands}  # 已按优先级插入，第一个即第一目标
     first = cands[0]
     lines = [
-        "今晚要抢的讲座（18:50 预检查）：",
+        f"今晚要抢的讲座（{_hhmm} 预检查）：",
         "",
         f"【第一目标】{first['title']}",
         f"  类别：{first.get('category', '?')}",
@@ -1144,7 +1152,7 @@ def precheck_and_notify():
             lines.append(f"  {i}) 第{_lecture_tier(c) + 1}档 {_mode}/{c.get('host_campus') or c.get('campus', '?')}"
                          f"｜{c['title']}｜开放 {c.get('open_time', '?')}")
     lines += ["", "19:00 进入详情页点“预约”。抢到 / 没抢到 / 转回流监控都会再通知你。"]
-    send_qq_mail(f"【SEU抢票】今晚目标：{first['title'][:24]}", "\n".join(lines))
+    _send_logged(f"【SEU抢票】今晚目标：{first['title'][:24]}", "\n".join(lines))
     print(f"✅ 发现 {len(cands)} 场，第一目标: {first['title']}")
     return targets, first
 
