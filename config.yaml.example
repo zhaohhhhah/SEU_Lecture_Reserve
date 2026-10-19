@@ -22,6 +22,11 @@ qq_auth_code: ""       # QQ 邮箱 SMTP 授权码（不是 QQ 登录密码）
 # 指定讲座名称（精确/部分匹配），留空表示不按名称筛选
 preferred_lectures: []
 
+# 标题里含这些词的讲座一律跳过（不分大小写），用来排除“测试”类占位讲座
+exclude_keywords:
+  - "测试"
+  - "test"
+
 # 想抢的讲座类别白名单
 required_categories:
   - "人文与科学素养系列讲座_心理健康"

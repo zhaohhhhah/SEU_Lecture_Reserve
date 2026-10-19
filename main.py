@@ -74,6 +74,7 @@ CONFIG = {
 
     # 讲座筛选条件
     "preferred_lectures": [],
+    "exclude_keywords": ["测试", "test"],   # 标题含这些词的一律跳过（不分大小写）
     "required_categories": [
         "人文与科学素养系列讲座_心理健康",
         "人文与科学素养系列讲座_法律",
@@ -604,11 +605,16 @@ def _grabs_tonight(lecture, now=None):
     now = now or datetime.now()
     close_t = _parse_hd_time(lecture.get("close_time"))
     open_t = _parse_hd_time(lecture.get("open_time"))
-    if close_t is not None and close_t <= now:
-        return False
     if open_t is not None and open_t.date() > now.date():
-        return False
-    return True
+        return False                      # 明天及以后才开放
+    if close_t is not None:
+        return close_t > now              # 有截止时间：还没截止就能抢
+    if open_t is not None:
+        # 只知道开放时间、不知道截止时间：必须今天开放才算今晚能抢。
+        # （曾经有场“系统测试（请勿预约）”，开放时间是一年前、截止时间解析不出来，
+        #   按失败放行会把它当成今晚目标）
+        return open_t.date() == now.date()
+    return True                           # 两个都解析不到才失败放行
 
 # ==================== 看门狗状态标记 ====================
 # .seu_active  存在 = 这一轮还没正常收尾（崩了就该被 guard 拉起）
@@ -655,8 +661,20 @@ def wait_until(hour, minute, label=""):
             return
         time.sleep(min(delta, 10))
 
+def _excluded_keyword(lecture):
+    """标题命中 CONFIG["exclude_keywords"] 就返回命中的词，否则返回空串。
+    用来跳过“测试”之类的占位 / 内部讲座（不分大小写）。"""
+    title = (lecture.get("title") or "").lower()
+    for kw in (CONFIG.get("exclude_keywords") or []):
+        kw = str(kw).strip()
+        if kw and kw.lower() in title:
+            return kw
+    return ""
+
 def is_candidate(lecture):
     """按条件筛选候选讲座（忽略按钮状态；用于“今天有没有可抢的”）"""
+    if _excluded_keyword(lecture):
+        return False
     if CONFIG["preferred_lectures"]:
         return lecture["title"] in CONFIG["preferred_lectures"]
     if lecture["category"] not in CONFIG["required_categories"]:
@@ -1079,6 +1097,10 @@ def precheck_and_notify():
     # 不核日期的后果：列表里有 4 场时，会把下下周才开预约的排成第一目标，
     # 19:00 点进去按钮一直是「未开放」，空转一整晚，真正开放的那场反而没抢。
     _now = datetime.now()
+    for c in cards:
+        _kw = _excluded_keyword(c)
+        if _kw:
+            print(f"⏭ 跳过（标题含“{_kw}”）: {c['title'][:40]}")
     _matched = [c for c in cards if is_candidate(c)]
     for c in _matched:
         if not _grabs_tonight(c, _now):
