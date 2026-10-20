@@ -13,6 +13,7 @@ from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException
 import time
 import base64
+import argparse
 import ddddocr
 import re
 from datetime import datetime
@@ -101,6 +102,7 @@ CONFIG = {
         "scan_interval": 0.05,   # 扫描间隔时间
         "retry_delay": 0.05,     # 重试延迟时间
         "action_confirm": 0.2,   # 操作确认等待时间
+        "captcha_wait": 10,      # 验证码弹窗出现的最长等待（19:00 高峰期要数秒）
     }
 }
 
@@ -144,6 +146,10 @@ def send_qq_mail(subject, body, attempts=3):
     """通过 QQ 邮箱 SMTP 发通知；凭据优先读环境变量，否则用默认值。
     容器出站链路偶尔会 Network is unreachable（实测碰到过），所以失败重试几次——
     邮件是抢票结果唯一的通知渠道，不能因为一次抖动就丢了。返回是否最终成功。"""
+    # 测试模式（--no-mail / SEU_NO_MAIL=1）：只打日志，不发信
+    if NO_MAIL:
+        print(f"📭 [--no-mail] 已跳过发信: {subject}")
+        return True
     addr = os.environ.get("QQ_EMAIL_ADDRESS") or CONFIG.get("qq_email") or ""
     code = os.environ.get("QQ_EMAIL_AUTH_CODE") or CONFIG.get("qq_auth_code") or ""
     if not addr or not code:
@@ -167,8 +173,10 @@ def send_qq_mail(subject, body, attempts=3):
                 time.sleep(2 * i)
     return False
 
-# 登录成功通知去重标志
-_LOGIN_NOTIFIED = False
+# 最近一次登录成功的时间：合并进预检查邮件，不再单独发「已登录就位」
+_LOGIN_TIME = None
+# 测试模式：True 时 send_qq_mail 只打日志不发信（--no-mail / SEU_NO_MAIL=1）
+NO_MAIL = False
 # “疑似抢到但没能确认”只通知一次，避免在循环里狂发
 _AMBIG_NOTIFIED = False
 
@@ -456,11 +464,10 @@ def _login_once(redirect_wait=None):
                                   "请打开 http://10.201.114.88:3000（账号/密码：admin）在其浏览器里手动完成登录。")
             return False
         else:
-            print("✅ 登录成功！")
-            global _LOGIN_NOTIFIED
-            if not _LOGIN_NOTIFIED:
-                _LOGIN_NOTIFIED = True
-                send_qq_mail("【SEU抢票】已登录就位", "已成功登录东大讲座系统，开始扫描待命；抢到会再通知你。")
+            global _LOGIN_TIME
+            _LOGIN_TIME = datetime.now().strftime("%H:%M:%S")
+            # 不单独发「已登录就位」：登录状态并入紧接着的预检查邮件，只收一封
+            print(f"✅ 登录成功（{_LOGIN_TIME}），登录结果随预检查邮件一起发")
             return True
 
     except Exception as e:
@@ -829,14 +836,104 @@ def _is_booked():
     return False
 
 
+def _read_ticket_no(title, wait=10):
+    """「我的活动」→ 找到 title 对应的卡片 → 点「查看入场券」→ 读 NO.xxx。
+    返回 'NO.590' 这类字符串；任何一步失败返回 None（绝不阻塞成功通知）。
+    只认标题严格匹配的卡片——绝不退而取第一张：列表还没刷新出刚才的预约时，
+    取第一张会读到旧讲座的序号，给用户汇报错误的抢票顺序。"""
+    try:
+        # 0) 预约成功弹窗可能还开着，遮罩会拦截后续点击 → 先关掉
+        for sel in (".mint-msgbox-btn", "#jqalert_yes_btn"):
+            for e in driver.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if e.is_displayed():
+                        e.click()
+                        time.sleep(0.2)
+                except Exception:
+                    pass
+
+        # 1) 切到「我的活动」tab（mint-tab-item，不是链接）。
+        #    SPA 可能还在渲染（刚登录/刚切页时 tab 尚不存在），在 wait 内轮询等它出现。
+        clicked = False
+        _tab_deadline = time.time() + wait
+        while time.time() < _tab_deadline and not clicked:
+            for e in driver.find_elements(By.CSS_SELECTOR, ".mint-tab-item"):
+                try:
+                    if "我的活动" in (e.text or "") and e.is_displayed():
+                        e.click()
+                        clicked = True
+                        break
+                except Exception:
+                    pass
+            if not clicked:
+                for e in driver.find_elements(By.XPATH, "//*[contains(text(),'我的活动')]"):
+                    try:
+                        if e.is_displayed():
+                            driver.execute_script("arguments[0].click()", e)
+                            clicked = True
+                            break
+                    except Exception:
+                        pass
+            if not clicked:
+                time.sleep(0.2)
+        if not clicked:
+            print("  ⚠ 没找到「我的活动」tab（页面可能未加载完）")
+            return None
+
+        # 2) 在 wait 内反复找标题匹配的「查看入场券」按钮：
+        #    我的活动列表可能还没刷新出刚才的预约，多等几秒而不是错读第一张
+        deadline = time.time() + wait
+        target = None
+        while time.time() < deadline:
+            btns = driver.find_elements(
+                By.XPATH, "//button[contains(text(),'查看入场券')]")
+            for b in btns:
+                # 从按钮向上逐层找文本包含标题的卡片容器（限定文本长度，
+                # 防止一路匹配到 body/列表容器，把别的卡片也算进来）
+                try:
+                    node = b
+                    for _ in range(8):
+                        node = node.find_element(By.XPATH, "..")
+                        _t = node.text or ""
+                        if title and title in _t and len(_t) < 1000:
+                            target = b
+                            break
+                except Exception:
+                    pass
+                if target:
+                    break
+            if target:
+                break
+            time.sleep(0.3)
+        if target is None:
+            print("  ⚠ 我的活动里没找到该讲座的入场券（列表可能尚未刷新）")
+            return None
+        target.click()
+
+        # 4) 入场券弹窗里 NO.xxx 的 class 是 hdxq-rcq-no
+        no_el = WebDriverWait(driver, wait).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".hdxq-rcq-no")))
+        no = (no_el.text or "").strip()
+        if no:
+            print(f"🎫 入场券序号: {no}")
+        return no or None
+    except Exception as e:
+        print(f"  ⚠ 读取入场券序号失败: {type(e).__name__}: {str(e).splitlines()[0]}")
+        return None
+
+
 def _announce_success(info, subject="【SEU抢票】预约成功", shot=None, extra=""):
     """抢到就立刻发邮件（不等待、不攒批），并存一张截图作凭证"""
     if shot is None:
         shot = _state_path("shot_success.png")
     try:
-        driver.save_screenshot(shot)
+        driver.save_screenshot(shot)   # 先在详情页截成功凭证，再去「我的活动」查序号
     except Exception:
         pass
+    # 汇报抢票顺序：入场券上的 NO.xxx（失败不影响发信）
+    ticket_no = _read_ticket_no(info.get("title", ""))
+    if ticket_no:
+        extra = (extra + "\n" if extra else "") + f"🎫 抢票序号：{ticket_no}"
     _body = (f"已预约：{info['title']}\n时间：{_fmt_time(info['start_time'])} ~ {_fmt_time(info['end_time'])}"
              f"\n校区：{info['campus']}")
     if extra:
@@ -968,11 +1065,74 @@ def do_captcha():
     返回：True=确认预约成功；None=已提交但没拿到明确结果（疑似成功，需人工确认）；False=明确失败可重试。
     **刻意不做**“整页 page_source 里含‘成功’就判成功”——详情页静态文案里就可能出现“成功”二字
     （比如“预约成功后请按时参加”），那样会在没抢到时就误报成功、并让整个流程提前 return 退出。"""
-    wait = WebDriverWait(driver, CONFIG["timeout_settings"]["element_wait"] // 2)
-    vcode_img = wait.until(EC.presence_of_element_located((By.ID, "vcodeImg")))
-    img_data = base64.b64decode(vcode_img.get_attribute("src").split("base64,")[1])
-    captcha_text = ocr.classification(img_data)
+    # 19:00 高峰期点完「预约」后，弹窗/验证码图往往要 1~3 秒才渲染出来。
+    # 原来这里复用 element_wait // 2（只有 1 秒），2026-10-20 实测点击后 1.018s
+    # 就超时；异常冒泡到抢票循环的 except → continue → 刷新详情页，把刚出现的
+    # 验证码弹窗刷掉，整晚表现为“一直在刷新、验证码没识别”。改成独立等待，
+    # 且等待期间**不刷新页面**；点完直接约上的情况先靠「取消预约」判定。
+    captcha_wait = float(CONFIG["timeout_settings"].get("captcha_wait", 10))
+    deadline = time.time() + captcha_wait
+    vcode_img = None
+    while time.time() < deadline:
+        try:
+            if _is_booked():
+                return True
+        except Exception:
+            pass
+        try:
+            # 只认可见的验证码图：DOM 里可能残留上一次弹窗的隐藏 vcodeImg，
+            # 读到旧图会 OCR 出过期验证码、白提交一轮
+            found = []
+            for e in driver.find_elements(By.ID, "vcodeImg"):
+                try:
+                    if e.is_displayed():
+                        found.append(e)
+                except Exception:
+                    pass
+        except Exception:
+            found = []
+        if found:
+            vcode_img = found[0]
+            break
+        time.sleep(0.1)
+    if vcode_img is None:
+        try:
+            if _is_booked():
+                return True
+        except Exception:
+            pass
+        print(f"  ⚠ {captcha_wait:.0f}s 内未出现验证码弹窗（按钮可能未生效），交给上层重试")
+        return False
+
+    # 元素出现后图片 src 可能还没填好（异步加载），等它变成 data:image 再 OCR。
+    # 图片最多等 3 秒：失败路径别把 10 秒全耗在等图上，留给下一轮重试。
+    src = ""
+    _img_deadline = time.time() + min(captcha_wait, 3)
+    while time.time() < _img_deadline:
+        try:
+            src = vcode_img.get_attribute("src") or ""
+        except Exception:
+            src = ""
+        if "base64," in src:
+            break
+        time.sleep(0.1)
+    if "base64," not in src:
+        print("  ⚠ 验证码图片未加载完成，交给上层重试")
+        return False
+
+    wait = WebDriverWait(driver, captcha_wait)
+    try:
+        img_data = base64.b64decode(src.split("base64,")[1])
+    except Exception:
+        print("  ⚠ 验证码图片解码失败，交给上层重试")
+        return False
+    captcha_text = (ocr.classification(img_data) or "").strip()
     print(f"  验证码识别结果: {captcha_text}")
+    # 只提交像验证码的结果（字母/数字 3~6 位）：OCR 抖动出的乱码/中文直接丢弃，
+    # 免得白占一次提交、多触发一次服务端失败
+    if not re.fullmatch(r"[A-Za-z0-9]{3,6}", captcha_text):
+        print("  验证码识别结果格式异常，交给上层重试")
+        return False
     vcode_input = wait.until(EC.presence_of_element_located((By.ID, "vcodeInput")))
     vcode_input.clear()
     vcode_input.send_keys(captcha_text)
@@ -1099,6 +1259,7 @@ def precheck_and_notify():
     没有符合条件的讲座则发“今天不抢”邮件并返回 (None, None)。"""
     # 时间一律取实际时刻：手动提前跑时邮件里不该再写死“18:50”
     _hhmm = datetime.now().strftime("%H:%M")
+    _login_line = f"登录：成功（{_LOGIN_TIME or '时间未知'}）"
     print(f"🔎 {_hhmm} 预检查今天的讲座...")
     cards = scan_cards()
     # 先按条件筛，再按“今晚抢不抢得到”核日期：预约未截止、且不是明天以后才开放。
@@ -1125,16 +1286,18 @@ def precheck_and_notify():
                                for c in _matched)
             print(f"有 {len(_matched)} 场符合条件，但都不在今晚的开放窗口，跳过今天")
             _send_logged("【SEU抢票】今天不抢讲座",
-                         f"{_hhmm} 预检查：有 {len(_matched)} 场符合筛选条件，但预约都已截止、"
+                         f"{_login_line}\n\n{_hhmm} 预检查：有 {len(_matched)} 场符合筛选条件，但预约都已截止、"
                          f"或要等到明天以后才开放，今晚抢不了，跳过。\n\n{detail}")
         else:
             print("今天没有符合条件的讲座，跳过今天")
             _send_logged("【SEU抢票】今天不抢讲座",
-                         f"{_hhmm} 预检查：今天没有符合条件的讲座，跳过今天，不抢。")
+                         f"{_login_line}\n\n{_hhmm} 预检查：今天没有符合条件的讲座，跳过今天，不抢。")
         return None, None
     targets = {c["title"]: c for c in cands}  # 已按优先级插入，第一个即第一目标
     first = cands[0]
     lines = [
+        _login_line,
+        "",
         f"今晚要抢的讲座（{_hhmm} 预检查）：",
         "",
         f"【第一目标】{first['title']}",
@@ -1244,7 +1407,7 @@ def main_process():
                 current = next(iter(targets), None)
                 continue
         except Exception as e:
-            print(f"‼ 抢票异常: {str(e).splitlines()[0]}")  # 只打首行：selenium 的长 stacktrace
+            print(f"‼ 抢票异常: {type(e).__name__}: {str(e).splitlines()[0]}")  # 只打首行：selenium 的长 stacktrace
             stuck += 1                                    # 会把日志刷爆（实测一晚上 1300+ 行）
             time.sleep(min(0.2 * stuck, 2.0))
             continue
@@ -1279,6 +1442,14 @@ def main_process():
 
 # ==================== 程序入口 ====================
 if __name__ == "__main__":
+    # 测试用开关：--no-mail 或环境变量 SEU_NO_MAIL=1 时不发任何邮件
+    _ap = argparse.ArgumentParser(description="东南大学讲座抢票")
+    _ap.add_argument("--no-mail", action="store_true",
+                     help="不发任何邮件（测试用；也可用环境变量 SEU_NO_MAIL=1）")
+    NO_MAIL = (_ap.parse_args().no_mail
+               or os.environ.get("SEU_NO_MAIL", "").lower() in ("1", "true", "yes"))
+    if NO_MAIL:
+        print("📭 测试模式（--no-mail）：本次运行不发任何邮件")
     # 看门狗状态：本轮开始 → 写 ACTIVE + PID（guard 靠 PID 判活，不用 pgrep 免得自匹配）+ 打一次心跳
     clear_state(".seu_done")
     mark_state(".seu_active", str(int(time.time())))
