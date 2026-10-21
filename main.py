@@ -349,7 +349,10 @@ def relogin(redirect_wait=None):
         _u = driver.current_url or ""
         if "auth.seu.edu.cn" in _u or "login" in _u:
             print("🔁 页面跳到认证页，会话已过期，重新登录...")
-            return login(redirect_wait=redirect_wait)
+            ok = login(redirect_wait=redirect_wait)
+            if not ok:
+                print("‼ 开抢前重新登录失败：已发送提醒邮件，请到 KasmVNC 手动登录")
+            return ok
         print("✅ 会话仍有效，直接待命")
         return True
     except Exception as e:
@@ -367,7 +370,10 @@ def ensure_logged_in(redirect_wait=30):
         _u = driver.current_url or ""
         if "auth.seu.edu.cn" in _u or "login" in _u:
             print("🔁 会话已过期，重新登录...")
-            return login(redirect_wait=redirect_wait)
+            ok = login(redirect_wait=redirect_wait)
+            if not ok:
+                print("‼ 开抢前登录检查失败：已发送提醒邮件，请到 KasmVNC 手动登录")
+            return ok
         print("✅ 会话仍有效，直接待命")
         return True
     except Exception as e:
