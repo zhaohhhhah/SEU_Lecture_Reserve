@@ -861,8 +861,10 @@ def fast_reload_detail(wid, wait=3):
         return False
 
 def click_detail_button():
-    """在活动详情页点击文本为“预约”的大按钮；点到返回 True"""
-    for b in driver.find_elements(By.CSS_SELECTOR, "button"):
+    """在活动详情页点击文本为“预约”的大按钮；点到返回 True。
+    只查 button.ydd-button-large：原来遍历页面上所有 button，每个都要 3 次
+    WebDriver 往返（text/is_displayed/is_enabled），开放瞬间可能白花上百毫秒。"""
+    for b in driver.find_elements(By.CSS_SELECTOR, "button.ydd-button-large"):
         try:
             if b.text.strip() == "预约" and b.is_displayed() and b.is_enabled():
                 b.click()
@@ -1439,6 +1441,10 @@ def main_process():
     # 3) 准点：已提前在详情页；按钮不会自己变，必须不停刷新详情页
     titles = list(targets)
     open_ts = open_dt.timestamp()
+    # 开放前 1 秒预热一次：进详情页后已空闲等了近 1 分钟，SPA 路由和接口连接
+    # 可能转冷；先刷一次，避免 12:00 的第一轮刷新承担冷启动开销。
+    wait_until_dt(open_ts - 1.0, "开抢前预热")
+    fast_reload_detail(current_wid())
     # 提前 0.1 秒开始刷新：路由刷新约 0.07s，让第一轮回包正好落在开放时刻附近，
     # 同时吸收本机与服务器的微小时钟偏差。未开放时刷新无害——按钮仍是「未开放」，
     # click_detail_button() 只认精确的「预约」，不会误点。
@@ -1458,6 +1464,7 @@ def main_process():
             current = enter_detail(titles)
             continue
         try:
+            _t0 = time.perf_counter()
             # 不在详情页就先进目标详情页
             if "#/hdxq" not in driver.current_url:
                 current = enter_detail(titles)
@@ -1478,6 +1485,7 @@ def main_process():
                         pass
                 time.sleep(min(0.2 * stuck, 2.0))
                 continue
+            _t1 = time.perf_counter()
             stuck = 0
             t = targets.get(current, next(iter(targets.values())))
             # 「取消预约」= 已经约上了 → 最可靠的信号，立刻报成功并停（别再空转）
@@ -1485,7 +1493,13 @@ def main_process():
                 print(f"🎉 详情页已显示「取消预约」→ 确认已约上，抢到用时 {_grab_elapsed_str()}")
                 _announce_success(t, extra=f"⏱ 抢到用时：{_grab_elapsed_str()}（自 {_open_hhmm}:00 起）")
                 return
+            _t2 = time.perf_counter()
             if click_detail_button():
+                _t3 = time.perf_counter()
+                # 开放后 2 秒内打印各步耗时，供下一次优化定位（perf_counter 开销可忽略）
+                if time.time() < open_ts + 2:
+                    print(f"  ⏱ 刷新 {(_t1 - _t0) * 1000:.0f}ms / 已约检查 "
+                          f"{(_t2 - _t1) * 1000:.0f}ms / 点击 {(_t3 - _t2) * 1000:.0f}ms")
                 print("  已点击“预约”按钮，处理验证码...")
                 res = do_captcha()
                 if res is True:
