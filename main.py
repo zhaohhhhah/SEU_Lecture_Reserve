@@ -16,7 +16,7 @@ import base64
 import argparse
 import ddddocr
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import platform
 import smtplib
@@ -44,13 +44,13 @@ _GRAB_T0 = None
 
 
 def _mark_grab_start(open_ts):
-    """进入 19:00 抢票循环前调用。把 perf_counter 基准**倒推**到 open_ts（本机时钟的
-    19:00:00.000），这样“抢到用时”是从开放那一刻算起，不受随后 while 轮询最多 20ms 的过冲影响。"""
+    """进入抢票循环前调用。把 perf_counter 基准**倒推**到 open_ts（本机时钟的开放时刻），
+    这样“抢到用时”是从开放那一刻算起，不受随后 while 轮询最多 20ms 的过冲影响。"""
     global _GRAB_T0
     _GRAB_T0 = time.perf_counter() - (time.time() - open_ts)
     _ms = int(open_ts % 1 * 1000)
-    print("⏱ 计时起点 = 19:00:00（本机时钟 %s.%03d）"
-          % (datetime.fromtimestamp(open_ts).strftime("%H:%M:%S"), _ms))
+    _open_str = datetime.fromtimestamp(open_ts).strftime("%H:%M:%S")
+    print("⏱ 计时起点 = %s（本机时钟 %s.%03d）" % (_open_str, _open_str, _ms))
 
 
 def _grab_elapsed_str():
@@ -340,6 +340,35 @@ def login(redirect_wait=None):
     return False
 
 
+def relogin(redirect_wait=None):
+    """开抢前重新登录一次（8:00 那次只用来确定目标，隔几小时会话多半已过期）。
+    先清掉 SSO cookie 强制走登录流程——已登录状态直接打开登录页会被重定向，
+    找不到用户名输入框，反而会误判为登录页异常。"""
+    try:
+        driver.delete_all_cookies()
+    except Exception as e:
+        print(f"⚠ 清理 cookie 失败（继续尝试登录）: {type(e).__name__}: {str(e).splitlines()[0]}")
+    return login(redirect_wait=redirect_wait)
+
+
+def ensure_logged_in(redirect_wait=30):
+    """开抢前确认会话仍有效。
+    现在每天 8:00 就登录并确定目标，到中午/晚上开抢可能已隔数小时，SSO 会话可能过期。
+    打开列表页看是否被重定向到认证页：过期才重新登录，有效就直接复用会话。"""
+    try:
+        driver.get(LIST_URL)
+        time.sleep(CONFIG["timeout_settings"]["page_load"])
+        _u = driver.current_url or ""
+        if "auth.seu.edu.cn" in _u or "login" in _u:
+            print("🔁 会话已过期，重新登录...")
+            return login(redirect_wait=redirect_wait)
+        print("✅ 会话仍有效，直接待命")
+        return True
+    except Exception as e:
+        print(f"⚠ 会话检查失败: {type(e).__name__}: {str(e).splitlines()[0]}")
+        return False
+
+
 def _login_once(redirect_wait=None):
     """执行一次系统登录操作 - 通用版本。redirect_wait 可覆盖登录后的等待秒数（抢票时用短值）"""
     try:
@@ -623,6 +652,16 @@ def _grabs_tonight(lecture, now=None):
         return open_t.date() == now.date()
     return True                           # 两个都解析不到才失败放行
 
+def _grab_time(first, now=None):
+    """本轮的开抢时刻：取第一目标预约窗口里的开放时间（精确到分钟）。
+    原来写死当天 19:00——遇到中午 12:00 开放的场次，18:49 才启动的 cron 根本赶不上。
+    开放时间解析不到、或不是今天 → 回退当天 19:00（保持原有默认行为）。"""
+    now = now or datetime.now()
+    open_t = _parse_hd_time(first.get("open_time"))
+    if open_t is not None and open_t.date() == now.date():
+        return open_t
+    return now.replace(hour=19, minute=0, second=0, microsecond=0)
+
 # ==================== 看门狗状态标记 ====================
 # .seu_active  存在 = 这一轮还没正常收尾（崩了就该被 guard 拉起）
 # .seu_done    存在 = 本轮已正常收尾（成功/无讲座/正常结束，guard 别管）
@@ -665,6 +704,17 @@ def wait_until(hour, minute, label=""):
         delta = (target - now).total_seconds()
         if delta <= 0:
             print(f"⏰ 到达 {hour:02d}:{minute:02d} {label}")
+            return
+        time.sleep(min(delta, 10))
+
+def wait_until_dt(target, label=""):
+    """阻塞到指定的 datetime（用于中午/晚上等不固定开放时刻）。
+    等待期间持续打心跳，避免被看门狗误判为卡死。"""
+    while True:
+        heartbeat()
+        delta = (target - datetime.now()).total_seconds()
+        if delta <= 0:
+            print(f"⏰ 到达 {target:%H:%M:%S} {label}")
             return
         time.sleep(min(delta, 10))
 
@@ -1254,7 +1304,7 @@ def _send_logged(subject, body):
 
 
 def precheck_and_notify():
-    """18:50 预检查：扫描今天的讲座、按优先级排序、发通知邮件。
+    """抢票前预检查（默认 18:49 启动）：扫描今天的讲座、按优先级排序、发通知邮件。
     返回 (targets, first)：有讲座时 targets={标题:讲座}(已按优先级插入，第一个即第一目标)、first=第一目标；
     没有符合条件的讲座则发“今天不抢”邮件并返回 (None, None)。"""
     # 时间一律取实际时刻：手动提前跑时邮件里不该再写死“18:50”
@@ -1275,6 +1325,16 @@ def precheck_and_notify():
         if not _grabs_tonight(c, _now):
             print(f"⏭ 跳过（不在今晚开放窗口）: {c['title'][:36]}｜预约 {c.get('open_time') or '?'} ~ {c.get('close_time') or '?'}")
     cands = sorted([c for c in _matched if _grabs_tonight(c, _now)], key=_sort_priority)
+    # 优先“刚开放/即将开放”的场次（开放时间在最近 10 分钟以内，或还没到）。
+    # 中午 12:00 的场次在 11:49 预检查时，昨天 19:00 已开放、今天 12:00 才截止的场次
+    # 也还“未截止”，但它们不是本轮目标——其中可能已经预约过，抢票循环会把它读成
+    # 「取消预约」→ 误报成功。有即将开放的场次时，就只抢这些。
+    _recent_open = [c for c in cands
+                    if (_parse_hd_time(c.get("open_time")) or _now) >= _now - timedelta(minutes=10)]
+    if _recent_open:
+        if len(_recent_open) < len(cands):
+            print(f"⏭ 跳过 {len(cands) - len(_recent_open)} 场早已开放/非本轮目标的场次")
+        cands = _recent_open
     for _i, c in enumerate(cands):
         _mode = "线上" if "线上" in c["title"] else "线下"
         _cp = c.get("host_campus") or c["campus"]
@@ -1295,10 +1355,13 @@ def precheck_and_notify():
         return None, None
     targets = {c["title"]: c for c in cands}  # 已按优先级插入，第一个即第一目标
     first = cands[0]
+    _grab_dt = _grab_time(first, _now)
+    _grab_hhmm = _grab_dt.strftime("%H:%M")
+    _relogin_hhmm = (_grab_dt - timedelta(minutes=11)).strftime("%H:%M")
     lines = [
         _login_line,
         "",
-        f"今晚要抢的讲座（{_hhmm} 预检查）：",
+        f"本轮要抢的讲座（{_hhmm} 预检查）：",
         "",
         f"【第一目标】{first['title']}",
         f"  类别：{first.get('category', '?')}",
@@ -1314,37 +1377,51 @@ def precheck_and_notify():
             _mode = "线上" if "线上" in c["title"] else "线下"
             lines.append(f"  {i}) 第{_lecture_tier(c) + 1}档 {_mode}/{c.get('host_campus') or c.get('campus', '?')}"
                          f"｜{c['title']}｜开放 {c.get('open_time', '?')}")
-    lines += ["", "19:00 进入详情页点“预约”。抢到 / 没抢到 / 转回流监控都会再通知你。"]
-    _send_logged(f"【SEU抢票】今晚目标：{first['title'][:24]}", "\n".join(lines))
+    lines += ["", f"{_relogin_hhmm} 重新登录，{_grab_hhmm} 进入详情页点“预约”。"
+                   "抢到 / 没抢到 / 转回流监控都会再通知你。"]
+    _send_logged(f"【SEU抢票】本轮目标：{first['title'][:24]}", "\n".join(lines))
     print(f"✅ 发现 {len(cands)} 场，第一目标: {first['title']}")
     return targets, first
 
 
 def main_process():
-    """主流程：18:50 预检查 → 18:59 定位 → 19:00 进详情页点“预约”+验证码"""
+    """主流程：预检查 → 开放前 1 分钟定位 → 到点进详情页点“预约”+验证码。
+    开抢时刻取第一目标预约窗口的开放时间（不再写死 19:00，中午 12:00 的场次同样适用）。"""
     # 1) 预检查：今天有没有符合条件的讲座（忽略按钮状态）
     targets, first = precheck_and_notify()
     if not targets:
         return
 
-    # 2) 18:59 刷新，确认目标仍在列表里
-    wait_until(18, 59, "刷新定位")
+    # 开抢时刻 = 第一目标的预约开放时间（按分钟）；开放前 1 分钟刷新定位
+    open_dt = _grab_time(first)
+    _open_hhmm = open_dt.strftime("%H:%M")
+    _relogin_dt = open_dt - timedelta(minutes=11)
+    print(f"⏳ 已确定开抢时刻 {_open_hhmm}，将在 {_relogin_dt:%H:%M} 重新登录")
+    wait_until_dt(_relogin_dt, "重新登录")
+
+    # 2) 开抢前 11 分钟重新登录（12:00 场次 = 11:49，等同原先 18:49 启动），
+    #    避免 8:00 的会话到开抢时已经过期。
+    relogin()
+
+    # 3) 开放前 1 分钟刷新，确认目标仍在列表里
+    wait_until_dt(open_dt - timedelta(seconds=60), "刷新定位")
+    ensure_logged_in()
     cards = scan_cards()
     keep = {c["title"]: c for c in cards if c["title"] in targets}
     if keep:
         targets = keep
-    print(f"🎯 18:59 目标: {list(targets)}")
-    # 提前一点点进入详情页待命：19:00 一到就只剩“点按钮”这一步
+    print(f"🎯 {_open_hhmm} 目标: {list(targets)}")
+    # 提前一点点进入详情页待命：开抢时刻一到就只剩“点按钮”这一步
     print(f"📄 已提前进入详情页待命: {enter_detail(list(targets))}")
 
-    # 3) 19:00 准点：已提前在详情页；按钮不会自己变，必须不停刷新详情页
+    # 3) 准点：已提前在详情页；按钮不会自己变，必须不停刷新详情页
     titles = list(targets)
-    open_ts = datetime.now().replace(hour=19, minute=0, second=0, microsecond=0).timestamp()
-    # 19:00 准时开始（不提前起手）
+    open_ts = open_dt.timestamp()
+    # 准点开始（不提前起手）
     while time.time() < open_ts:
         time.sleep(0.02)
-    _mark_grab_start(open_ts)  # 计时起点倒推到 19:00:00.000
-    print("🛒 19:00 准时开抢（不停刷新详情页）...")
+    _mark_grab_start(open_ts)  # 计时起点倒推到开放时刻
+    print(f"🛒 {_open_hhmm} 准时开抢（不停刷新详情页）...")
     end = open_ts + 270  # 最多抢 4.5 分钟（cron 兜底停止）
     current = next(iter(targets), None)  # 已提前进入详情页
     stuck = 0  # 连续刷新失败的次数，用于退避（人多/响应慢时别狂轰）
@@ -1353,7 +1430,7 @@ def main_process():
         # 浏览器被关掉/崩了：原地自愈（重建 + 重登）；救不回来就发通知并退出交给看门狗。
         # 没有这段的话，窗口一关就只会一直抛 "no such window"，空转到超时也不通知。
         if not _browser_alive():
-            _revive_or_die("19:00 抢票")
+            _revive_or_die(f"{_open_hhmm} 抢票")
             current = enter_detail(titles)
             continue
         try:
@@ -1382,14 +1459,14 @@ def main_process():
             # 「取消预约」= 已经约上了 → 最可靠的信号，立刻报成功并停（别再空转）
             if _is_booked():
                 print(f"🎉 详情页已显示「取消预约」→ 确认已约上，抢到用时 {_grab_elapsed_str()}")
-                _announce_success(t, extra=f"⏱ 抢到用时：{_grab_elapsed_str()}（自 19:00:00 起）")
+                _announce_success(t, extra=f"⏱ 抢到用时：{_grab_elapsed_str()}（自 {_open_hhmm}:00 起）")
                 return
             if click_detail_button():
                 print("  已点击“预约”按钮，处理验证码...")
                 res = do_captcha()
                 if res is True:
-                    print(f"🎉 抢到！用时 {_grab_elapsed_str()}（自 19:00:00 起）")
-                    _announce_success(t, extra=f"⏱ 抢到用时：{_grab_elapsed_str()}（自 19:00:00 起）")
+                    print(f"🎉 抢到！用时 {_grab_elapsed_str()}（自 {_open_hhmm}:00 起）")
+                    _announce_success(t, extra=f"⏱ 抢到用时：{_grab_elapsed_str()}（自 {_open_hhmm}:00 起）")
                     return
                 elif res is None:
                     try:
@@ -1433,7 +1510,7 @@ def main_process():
             until_ts = min(until_ts, time.time() + _cap)
         print(f"♻️ 开始回流票监控，直到 {datetime.fromtimestamp(until_ts):%Y/%m/%d %H:%M:%S}")
         send_qq_mail("【SEU抢票】转为监控回流票",
-                     f"19:00 未抢到，转为回流票监控：约 {int(_cap)} 秒内每 {CONFIG.get('backflow_interval', 3)} 秒查一次，"
+                     f"{_open_hhmm} 未抢到，转为回流票监控：约 {int(_cap)} 秒内每 {CONFIG.get('backflow_interval', 3)} 秒查一次，"
                      f"到 {datetime.fromtimestamp(until_ts):%H:%M:%S} 结束。抢到会通知你。")
         if backflow_watch(targets, until_ts):
             print("🎉 回流票抢到，退出")
