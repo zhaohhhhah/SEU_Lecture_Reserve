@@ -837,6 +837,33 @@ def current_wid():
     m = re.search(r"WID=([\w\-]+)", driver.current_url)
     return m.group(1) if m else None
 
+_FALLBACK_WARNED = False
+# 详情页主按钮可能出现的文本（用于判断状态按钮是否已渲染）
+_STATE_TEXTS = ("未开放", "预约", "取消预约", "已预约", "已满", "已结束", "已截止")
+
+
+def _detail_buttons(d=None):
+    """取详情页按钮：优先 button.ydd-button-large（正常路径，快）；
+    一个都找不到时退回全部 button 再读一次——万一学校改了前端类名，
+    到点也不至于完全点不到。兜底只在正常选择器返回空时触发，不拖慢正常路径。"""
+    global _FALLBACK_WARNED
+    d = d or driver
+    btns = d.find_elements(By.CSS_SELECTOR, "button.ydd-button-large")
+    if btns:
+        return btns
+    btns = d.find_elements(By.CSS_SELECTOR, "button")
+    if btns and not _FALLBACK_WARNED:
+        _FALLBACK_WARNED = True
+        print("⚠ 一个 button.ydd-button-large 都没找到，已退回扫描全部 button（前端类名可能改了）")
+    return btns
+
+
+def _detail_ready(d):
+    """详情页主状态按钮是否已渲染：只认已知状态文本，
+    避免兜底扫描时把「返回上一页」之类的按钮当成已就绪。"""
+    return any((b.text or "").strip() in _STATE_TEXTS for b in _detail_buttons(d))
+
+
 def fast_reload_detail(wid, wait=3):
     """用 SPA 内部路由跳转刷新详情页数据（实测 ~0.065s，比整页重载 ~0.6s 快约 9 倍）。
     先回列表并确认详情页已卸载，再回详情、等按钮渲染出来，确保读到的是新数据。"""
@@ -854,17 +881,16 @@ def fast_reload_detail(wid, wait=3):
     driver.execute_script("location.hash = '#/hdxq?WID=%s'" % wid)
     try:
         WebDriverWait(driver, wait).until(
-            lambda d: "#/hdxq" in d.current_url
-            and any(b.text.strip() for b in d.find_elements(By.CSS_SELECTOR, "button.ydd-button-large")))
+            lambda d: "#/hdxq" in d.current_url and _detail_ready(d))
         return True
     except:
         return False
 
 def click_detail_button():
     """在活动详情页点击文本为“预约”的大按钮；点到返回 True。
-    只查 button.ydd-button-large：原来遍历页面上所有 button，每个都要 3 次
-    WebDriver 往返（text/is_displayed/is_enabled），开放瞬间可能白花上百毫秒。"""
-    for b in driver.find_elements(By.CSS_SELECTOR, "button.ydd-button-large"):
+    优先只查 button.ydd-button-large（原来遍历页面上所有 button，每个都要 3 次
+    WebDriver 往返，开放瞬间可能白花上百毫秒）；若类名找不到则兜底扫全部 button。"""
+    for b in _detail_buttons():
         try:
             if b.text.strip() == "预约" and b.is_displayed() and b.is_enabled():
                 b.click()
@@ -876,7 +902,7 @@ def click_detail_button():
 def _has_book_button():
     """详情页是否还有可点的「预约」大按钮（用来判断是不是已经约上了）"""
     try:
-        for b in driver.find_elements(By.CSS_SELECTOR, "button.ydd-button-large"):
+        for b in _detail_buttons():
             txt = (b.text or "").strip()
             if b.is_displayed() and b.is_enabled() and "预约" in txt and "取消" not in txt:
                 return True
@@ -892,7 +918,7 @@ def _is_booked():
     click_detail_button()（只认精确的"预约"）就再也点不动，
     循环会一直空转到超时、也不发成功邮件。"""
     try:
-        for b in driver.find_elements(By.CSS_SELECTOR, "button.ydd-button-large"):
+        for b in _detail_buttons():
             if b.is_displayed() and "取消预约" in (b.text or ""):
                 return True
     except Exception:
@@ -1280,7 +1306,7 @@ def backflow_watch(targets, until_ts):
                 driver.refresh()
                 try:
                     WebDriverWait(driver, 2).until(
-                        lambda d: any(b.text.strip() for b in d.find_elements(By.CSS_SELECTOR, "button.ydd-button-large")))
+                        lambda d: _detail_ready(d))
                     ok = True
                 except:
                     ok = False
@@ -1480,7 +1506,7 @@ def main_process():
                     try:
                         driver.refresh()
                         WebDriverWait(driver, 3).until(
-                            lambda d: any(b.text.strip() for b in d.find_elements(By.CSS_SELECTOR, "button.ydd-button-large")))
+                            lambda d: _detail_ready(d))
                     except Exception:
                         pass
                 time.sleep(min(0.2 * stuck, 2.0))
