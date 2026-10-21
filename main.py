@@ -341,14 +341,20 @@ def login(redirect_wait=None):
 
 
 def relogin(redirect_wait=None):
-    """开抢前重新登录一次（8:00 那次只用来确定目标，隔几小时会话多半已过期）。
-    先清掉 SSO cookie 强制走登录流程——已登录状态直接打开登录页会被重定向，
-    找不到用户名输入框，反而会误判为登录页异常。"""
+    """开抢前重新打开网页确认登录状态（**不清 cookie**）。
+    会话仍有效就直接复用页面；只有被重定向到统一认证页时才重新登录。"""
     try:
-        driver.delete_all_cookies()
+        driver.get(LIST_URL)
+        time.sleep(CONFIG["timeout_settings"]["page_load"])
+        _u = driver.current_url or ""
+        if "auth.seu.edu.cn" in _u or "login" in _u:
+            print("🔁 页面跳到认证页，会话已过期，重新登录...")
+            return login(redirect_wait=redirect_wait)
+        print("✅ 会话仍有效，直接待命")
+        return True
     except Exception as e:
-        print(f"⚠ 清理 cookie 失败（继续尝试登录）: {type(e).__name__}: {str(e).splitlines()[0]}")
-    return login(redirect_wait=redirect_wait)
+        print(f"⚠ 重新打开页面失败: {type(e).__name__}: {str(e).splitlines()[0]}")
+        return False
 
 
 def ensure_logged_in(redirect_wait=30):
@@ -1377,7 +1383,7 @@ def precheck_and_notify():
             _mode = "线上" if "线上" in c["title"] else "线下"
             lines.append(f"  {i}) 第{_lecture_tier(c) + 1}档 {_mode}/{c.get('host_campus') or c.get('campus', '?')}"
                          f"｜{c['title']}｜开放 {c.get('open_time', '?')}")
-    lines += ["", f"{_relogin_hhmm} 重新登录，{_grab_hhmm} 进入详情页点“预约”。"
+    lines += ["", f"{_relogin_hhmm} 重新打开页面确认登录，{_grab_hhmm} 进入详情页点“预约”。"
                    "抢到 / 没抢到 / 转回流监控都会再通知你。"]
     _send_logged(f"【SEU抢票】本轮目标：{first['title'][:24]}", "\n".join(lines))
     print(f"✅ 发现 {len(cands)} 场，第一目标: {first['title']}")
@@ -1396,11 +1402,11 @@ def main_process():
     open_dt = _grab_time(first)
     _open_hhmm = open_dt.strftime("%H:%M")
     _relogin_dt = open_dt - timedelta(minutes=11)
-    print(f"⏳ 已确定开抢时刻 {_open_hhmm}，将在 {_relogin_dt:%H:%M} 重新登录")
-    wait_until_dt(_relogin_dt, "重新登录")
+    print(f"⏳ 已确定开抢时刻 {_open_hhmm}，将在 {_relogin_dt:%H:%M} 重新打开页面确认登录")
+    wait_until_dt(_relogin_dt, "重新打开页面")
 
-    # 2) 开抢前 11 分钟重新登录（12:00 场次 = 11:49，等同原先 18:49 启动），
-    #    避免 8:00 的会话到开抢时已经过期。
+    # 2) 开抢前 11 分钟重新打开网页（12:00 场次 = 11:49，等同原先 18:49 启动）：
+    #    不清 cookie，会话还有效就直接用；失效才重新登录。
     relogin()
 
     # 3) 开放前 1 分钟刷新，确认目标仍在列表里
