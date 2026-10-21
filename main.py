@@ -914,6 +914,16 @@ def _read_ticket_no(title, wait=10):
                 except Exception:
                     pass
 
+        # 0.5) 抢票成功时页面还停在详情页（#/hdxq），详情页没有底部 tab。
+        #      先回到列表页再找「我的活动」；只导航，不点任何预约/取消按钮。
+        try:
+            _tabs = driver.find_elements(By.CSS_SELECTOR, ".mint-tab-item")
+            if not any("我的活动" in (e.text or "") for e in _tabs):
+                driver.get(LIST_URL)
+                time.sleep(CONFIG["timeout_settings"]["page_load"])
+        except Exception:
+            pass
+
         # 1) 切到「我的活动」tab（mint-tab-item，不是链接）。
         #    SPA 可能还在渲染（刚登录/刚切页时 tab 尚不存在），在 wait 内轮询等它出现。
         clicked = False
