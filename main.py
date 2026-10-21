@@ -1429,10 +1429,12 @@ def main_process():
     # 3) 准点：已提前在详情页；按钮不会自己变，必须不停刷新详情页
     titles = list(targets)
     open_ts = open_dt.timestamp()
-    # 准点开始（不提前起手）
-    while time.time() < open_ts:
+    # 提前 0.1 秒开始刷新：路由刷新约 0.07s，让第一轮回包正好落在开放时刻附近，
+    # 同时吸收本机与服务器的微小时钟偏差。未开放时刷新无害——按钮仍是「未开放」，
+    # click_detail_button() 只认精确的「预约」，不会误点。
+    while time.time() < open_ts - 0.1:
         time.sleep(0.02)
-    _mark_grab_start(open_ts)  # 计时起点倒推到开放时刻
+    _mark_grab_start(open_ts)  # 计时起点仍倒推到开放时刻
     print(f"🛒 {_open_hhmm} 准时开抢（不停刷新详情页）...")
     end = open_ts + 270  # 最多抢 4.5 分钟（cron 兜底停止）
     current = next(iter(targets), None)  # 已提前进入详情页
