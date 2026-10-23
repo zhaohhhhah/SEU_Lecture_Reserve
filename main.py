@@ -606,6 +606,9 @@ def _lecture_tier(lecture):
         _mode = r.get("mode")
         if _mode and _mode != mode:
             continue
+        _title = r.get("title")
+        if _title and _title not in (lecture.get("title") or ""):
+            continue
         _campus = r.get("campus")
         if _campus and (_campus not in campus and _campus not in location):
             continue
@@ -670,8 +673,13 @@ def _grab_time(first, now=None):
     开放时间解析不到、或不是今天 → 回退当天 19:00（保持原有默认行为）。"""
     now = now or datetime.now()
     open_t = _parse_hd_time(first.get("open_time"))
+    close_t = _parse_hd_time(first.get("close_time"))
     if open_t is not None and open_t.date() == now.date():
         return open_t
+    # 已经开放但还没截止（例如第二天早上 08:00 启动、窗口昨晚就开了）：
+    # 立刻开始，别傻等到 19:00（那时窗口早关了）。
+    if open_t is not None and close_t is not None and open_t <= now < close_t:
+        return now
     return now.replace(hour=19, minute=0, second=0, microsecond=0)
 
 # ==================== 看门狗状态标记 ====================
@@ -720,6 +728,8 @@ def wait_until(hour, minute, label=""):
         time.sleep(min(delta, 10))
 
 def wait_until_dt(target, label=""):
+    if isinstance(target, (int, float)):
+        target = datetime.fromtimestamp(target)
     """阻塞到指定的 datetime（用于中午/晚上等不固定开放时刻）。
     等待期间持续打心跳，避免被看门狗误判为卡死。"""
     while True:
@@ -819,17 +829,37 @@ def enter_detail(titles):
         el = found.get(t)
         if el is None:
             continue
+        content = None
         try:
-            el.find_element(By.CSS_SELECTOR, ".activity-content").click()
-        except Exception:
-            continue
+            content = el.find_element(By.CSS_SELECTOR, ".activity-content")
+            content.click()
+        except Exception as e:
+            print(f"  ⚠ 点击卡片异常({t[:24]}): {type(e).__name__}")
+            try:
+                if content is not None:
+                    driver.execute_script("arguments[0].click()", content)
+            except Exception:
+                pass
         try:
-            WebDriverWait(driver, CONFIG["timeout_settings"]["element_wait"]).until(
+            WebDriverWait(driver, max(CONFIG["timeout_settings"]["element_wait"], 5)).until(
                 lambda d: "#/hdxq" in d.current_url)
         except:
-            pass
+            # 原生 click 没跳转时再用 JS click 兜底一次
+            try:
+                if content is not None:
+                    driver.execute_script("arguments[0].click()", content)
+                    WebDriverWait(driver, 2).until(lambda d: "#/hdxq" in d.current_url)
+            except Exception:
+                pass
         if "#/hdxq" in driver.current_url:
+            try:
+                btns = [b.text.strip() for b in driver.find_elements(
+                    By.CSS_SELECTOR, "button.ydd-button-large")]
+            except Exception:
+                btns = []
+            print(f"  📄 已进入详情: {t[:30]} 按钮={btns}")
             return t
+        print(f"  ⚠ 未能进入详情: {t[:30]} url={driver.current_url}")
     return None
 
 def current_wid():
@@ -860,8 +890,17 @@ def _detail_buttons(d=None):
 
 def _detail_ready(d):
     """详情页主状态按钮是否已渲染：只认已知状态文本，
-    避免兜底扫描时把「返回上一页」之类的按钮当成已就绪。"""
-    return any((b.text or "").strip() in _STATE_TEXTS for b in _detail_buttons(d))
+    避免兜底扫描时把「返回上一页」之类的按钮当成已就绪。
+
+    2026-10-22 坑：原来用**精确等于**匹配，而满员时按钮文字是「人数已满」，
+    不在 _STATE_TEXTS（只有「已满」）里 → 详情页永远被判“没就绪”，
+    fast_reload_detail() 于是每轮都失败、把页面留在列表页，回流监控等于空转。
+    改成子串匹配（「人数已满」含「已满」）。同时要求 URL 真在详情页，
+    防止列表页兜底扫描时把卡片按钮当成就绪。"""
+    if "#/hdxq" not in d.current_url:
+        return False
+    return any(any(s in (b.text or "").strip() for s in _STATE_TEXTS)
+               for b in _detail_buttons(d))
 
 
 def fast_reload_detail(wid, wait=3):
@@ -889,7 +928,10 @@ def fast_reload_detail(wid, wait=3):
 def click_detail_button():
     """在活动详情页点击文本为“预约”的大按钮；点到返回 True。
     优先只查 button.ydd-button-large（原来遍历页面上所有 button，每个都要 3 次
-    WebDriver 往返，开放瞬间可能白花上百毫秒）；若类名找不到则兜底扫全部 button。"""
+    WebDriver 往返，开放瞬间可能白花上百毫秒）；若类名找不到则兜底扫全部 button。
+    必须先在真的详情页——否则在列表页兜底会点到别的讲座卡片上的「预约」。"""
+    if "#/hdxq" not in driver.current_url:
+        return False
     for b in _detail_buttons():
         try:
             if b.text.strip() == "预约" and b.is_displayed() and b.is_enabled():
@@ -916,10 +958,20 @@ def _is_booked():
     这是**最可靠的“成功”信号**——只有约上了才可能出现“取消预约”。
     原来完全没有这个判断：一旦约上，按钮从「预约」变「取消预约」，
     click_detail_button()（只认精确的"预约"）就再也点不动，
-    循环会一直空转到超时、也不发成功邮件。"""
+    循环会一直空转到超时、也不发成功邮件。
+
+    2026-10-22 误报教训：回流监控里详情页路由跳转失败、页面停在**列表页**时，
+    _detail_buttons() 的兜底会扫到别的已预约讲座卡片上的「取消预约」→ 误报成功。
+    所以这里加两道闸：必须真的在详情页（#/hdxq），且只认详情页主按钮
+    （优先 button.ydd-button-large；类名改了才退回全部 button）。"""
     try:
-        for b in _detail_buttons():
-            if b.is_displayed() and "取消预约" in (b.text or ""):
+        if "#/hdxq" not in driver.current_url:
+            return False
+        btns = driver.find_elements(By.CSS_SELECTOR, "button.ydd-button-large")
+        if not btns:
+            btns = driver.find_elements(By.CSS_SELECTOR, "button")
+        for b in btns:
+            if b.is_displayed() and (b.text or "").strip() == "取消预约":
                 return True
     except Exception:
         pass
@@ -1322,12 +1374,14 @@ def backflow_watch(targets, until_ts):
                     misses = 0
                     continue
             info = targets.get(cur, next(iter(targets.values())))
-            # 「取消预约」= 已经约上了 → 报成功并停
-            if _is_booked():
+            # 「取消预约」= 已经约上了 → 报成功并停。
+            # 只在详情页确认刷新成功(ok)时才判：刷新失败时页面可能停在列表，
+            # 那里别的讲座卡片上也有「取消预约」，会造成误报（2026-10-22 踩过）。
+            if ok and _is_booked():
                 print("  🎉 回流监控：详情页显示「取消预约」→ 已约上，退出")
                 _announce_success(info, "【SEU抢票】回流票预约成功")
                 return True
-            if click_detail_button():
+            if ok and click_detail_button():
                 print("  ♻️ 检测到开放，尝试预约...")
                 res = do_captcha()
                 if res is True:
@@ -1462,14 +1516,15 @@ def main_process():
         targets = keep
     print(f"🎯 {_open_hhmm} 目标: {list(targets)}")
     # 提前一点点进入详情页待命：开抢时刻一到就只剩“点按钮”这一步
-    print(f"📄 已提前进入详情页待命: {enter_detail(list(targets))}")
+    _entered = enter_detail(list(targets))
+    print(f"📄 已提前进入详情页待命: {_entered}")
 
     # 3) 准点：已提前在详情页；按钮不会自己变，必须不停刷新详情页
     titles = list(targets)
     open_ts = open_dt.timestamp()
     # 开放前 1 秒预热一次：进详情页后已空闲等了近 1 分钟，SPA 路由和接口连接
     # 可能转冷；先刷一次，避免 12:00 的第一轮刷新承担冷启动开销。
-    wait_until_dt(open_ts - 1.0, "开抢前预热")
+    wait_until_dt(datetime.fromtimestamp(open_ts - 1.0), "开抢前预热")
     fast_reload_detail(current_wid())
     # 提前 0.1 秒开始刷新：路由刷新约 0.07s，让第一轮回包正好落在开放时刻附近，
     # 同时吸收本机与服务器的微小时钟偏差。未开放时刷新无害——按钮仍是「未开放」，
@@ -1478,8 +1533,8 @@ def main_process():
         time.sleep(0.02)
     _mark_grab_start(open_ts)  # 计时起点仍倒推到开放时刻
     print(f"🛒 {_open_hhmm} 准时开抢（不停刷新详情页）...")
-    end = open_ts + 270  # 最多抢 4.5 分钟（cron 兜底停止）
-    current = next(iter(targets), None)  # 已提前进入详情页
+    end = max(open_ts + 270, time.time() + 270)  # 最多抢 4.5 分钟（晚启动也从现在算）
+    current = _entered or next(iter(targets), None)  # 已提前进入详情页
     stuck = 0  # 连续刷新失败的次数，用于退避（人多/响应慢时别狂轰）
     while time.time() < end:
         heartbeat()
