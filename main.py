@@ -340,42 +340,53 @@ def login(redirect_wait=None):
     return False
 
 
-def relogin(redirect_wait=None):
-    """开抢前重新打开网页确认登录状态（**不清 cookie**）。
-    会话仍有效就直接复用页面；只有被重定向到统一认证页时才重新登录。"""
+def _load_list_checked(wait=8):
+    """打开列表页，并确认页面真的渲染出了讲座卡片。
+    只看 URL 不够：会话失效时 SPA 的空壳仍停在 #/hdyy，直到调用业务接口才跳认证页。
+    2026-10-25 19:00 就是这样把已经失效的会话误判成“仍有效”，开抢时才发现被踢。
+    返回 True=列表可用；False=跳认证页 / 没卡片 / 加载失败。"""
     try:
         driver.get(LIST_URL)
         time.sleep(CONFIG["timeout_settings"]["page_load"])
         _u = driver.current_url or ""
         if "auth.seu.edu.cn" in _u or "login" in _u:
-            print("🔁 页面跳到认证页，会话已过期，重新登录...")
-            ok = login(redirect_wait=redirect_wait)
-            if not ok:
-                print("‼ 开抢前重新登录失败：已发送提醒邮件，请到 KasmVNC 手动登录")
-            return ok
-        print("✅ 会话仍有效，直接待命")
+            print(f"🔗 页面已跳到认证页: {_u}")
+            return False
+        WebDriverWait(driver, max(wait, CONFIG["timeout_settings"]["element_wait"])).until(
+            EC.presence_of_element_located((By.CLASS_NAME, "activity-container")))
         return True
+    except Exception as e:
+        print(f"⚠ 列表页没有加载出讲座卡片: {type(e).__name__}: {str(e).splitlines()[0]}")
+        return False
+
+
+def _check_or_relogin(redirect_wait, where):
+    """用“列表是否真的渲染出卡片”验证会话，失效才重登。"""
+    if _load_list_checked():
+        print("✅ 会话有效，列表已加载，直接待命")
+        return True
+    print(f"🔁 {where}：列表未加载（会话已失效），重新登录...")
+    ok = login(redirect_wait=redirect_wait)
+    if not ok:
+        print("‼ 重新登录失败：已发送提醒邮件，请到 KasmVNC 手动登录")
+    return ok
+
+
+def relogin(redirect_wait=None):
+    """开抢前重新打开网页确认登录状态（**不清 cookie**）。
+    列表真的渲染出卡片才算有效；有效就直接复用，失效才重新登录。"""
+    try:
+        return _check_or_relogin(redirect_wait, "开抢前")
     except Exception as e:
         print(f"⚠ 重新打开页面失败: {type(e).__name__}: {str(e).splitlines()[0]}")
         return False
 
 
 def ensure_logged_in(redirect_wait=30):
-    """开抢前确认会话仍有效。
-    现在每天 8:00 就登录并确定目标，到中午/晚上开抢可能已隔数小时，SSO 会话可能过期。
-    打开列表页看是否被重定向到认证页：过期才重新登录，有效就直接复用会话。"""
+    """开抢前确认会话仍有效（用真实列表加载验证，不只看 URL）。
+    每天 8:00 登录后可能隔数小时才开抢，SSO 会话过期时 SPA 外壳不会自己跳转。"""
     try:
-        driver.get(LIST_URL)
-        time.sleep(CONFIG["timeout_settings"]["page_load"])
-        _u = driver.current_url or ""
-        if "auth.seu.edu.cn" in _u or "login" in _u:
-            print("🔁 会话已过期，重新登录...")
-            ok = login(redirect_wait=redirect_wait)
-            if not ok:
-                print("‼ 开抢前登录检查失败：已发送提醒邮件，请到 KasmVNC 手动登录")
-            return ok
-        print("✅ 会话仍有效，直接待命")
-        return True
+        return _check_or_relogin(redirect_wait, "开抢前")
     except Exception as e:
         print(f"⚠ 会话检查失败: {type(e).__name__}: {str(e).splitlines()[0]}")
         return False
@@ -1511,12 +1522,21 @@ def main_process():
     wait_until_dt(open_dt - timedelta(seconds=60), "刷新定位")
     ensure_logged_in()
     cards = scan_cards()
+    if not cards:
+        # 列表空 = 会话可能刚失效（SPA 空壳），开抢前再重登一次并重扫
+        print("⚠ 开抢前扫描列表为空，重新确认登录后重扫...")
+        ensure_logged_in(redirect_wait=10)
+        cards = scan_cards()
     keep = {c["title"]: c for c in cards if c["title"] in targets}
     if keep:
         targets = keep
     print(f"🎯 {_open_hhmm} 目标: {list(targets)}")
     # 提前一点点进入详情页待命：开抢时刻一到就只剩“点按钮”这一步
     _entered = enter_detail(list(targets))
+    if not _entered:
+        print("⚠ 未能提前进入详情页，重新确认登录后再试一次...")
+        ensure_logged_in(redirect_wait=10)
+        _entered = enter_detail(list(targets))
     print(f"📄 已提前进入详情页待命: {_entered}")
 
     # 3) 准点：已提前在详情页；按钮不会自己变，必须不停刷新详情页
