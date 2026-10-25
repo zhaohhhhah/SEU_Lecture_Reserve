@@ -1533,7 +1533,13 @@ def main_process():
         time.sleep(0.02)
     _mark_grab_start(open_ts)  # 计时起点仍倒推到开放时刻
     print(f"🛒 {_open_hhmm} 准时开抢（不停刷新详情页）...")
-    end = max(open_ts + 270, time.time() + 270)  # 最多抢 4.5 分钟（晚启动也从现在算）
+    # 晚启动/看门狗重启：窗口已开放超过 1 分钟就别再空转 4.5 分钟的抢票热循环，
+    # 直接交给回流监控（它自己也会先密集刷新一轮）。否则每次重启都白刷几千次详情页。
+    if time.time() > open_ts + 60:
+        print(f"⏩ 窗口已开放 {int(time.time() - open_ts)}s，跳过抢票热循环，直接盯回流")
+        end = time.time()
+    else:
+        end = max(open_ts + 270, time.time() + 270)  # 最多抢 4.5 分钟（晚启动也从现在算）
     current = _entered or next(iter(targets), None)  # 已提前进入详情页
     stuck = 0  # 连续刷新失败的次数，用于退避（人多/响应慢时别狂轰）
     while time.time() < end:
@@ -1546,6 +1552,14 @@ def main_process():
             continue
         try:
             _t0 = time.perf_counter()
+            # 掉登录（被踢回认证页）必须优先处理：下面 enter_detail 失败会 continue，
+            # 若先判断详情页，就永远走不到循环末尾的重登分支，会在登录页空转到本轮结束
+            # （2026-10-25 19:00 就这么错过了抢票）。
+            if "auth.seu.edu.cn" in driver.current_url or "login" in driver.current_url:
+                print("🔁 登录失效，重新登录...")
+                login(redirect_wait=5)
+                current = next(iter(targets), None)
+                continue
             # 不在详情页就先进目标详情页
             if "#/hdxq" not in driver.current_url:
                 current = enter_detail(titles)
@@ -1596,12 +1610,6 @@ def main_process():
                     notify_ambiguous(t)
                 else:
                     print("  验证码失败，继续重试...")
-            # 掉登录（跳认证页）就重登；抢票窗口内用短等待，别耗 120s
-            if "auth.seu.edu.cn" in driver.current_url or "login" in driver.current_url:
-                print("🔁 登录失效，重新登录...")
-                login(redirect_wait=5)
-                current = next(iter(targets), None)
-                continue
         except Exception as e:
             print(f"‼ 抢票异常: {type(e).__name__}: {str(e).splitlines()[0]}")  # 只打首行：selenium 的长 stacktrace
             stuck += 1                                    # 会把日志刷爆（实测一晚上 1300+ 行）
