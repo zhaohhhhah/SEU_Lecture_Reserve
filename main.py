@@ -1381,6 +1381,9 @@ def backflow_watch(targets, until_ts):
                     if "auth.seu.edu.cn" in driver.current_url or "login" in driver.current_url:
                         print("🔁 登录失效，重新登录...")
                         login(redirect_wait=5)
+                    else:
+                        # 会话失效时 SPA 空壳可能不跳认证页，用列表是否真的渲染来确认
+                        ensure_logged_in(redirect_wait=5)
                     cur = enter_detail(titles)
                     misses = 0
                     continue
